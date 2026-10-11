@@ -59,7 +59,9 @@ func runInteractionGraceTests(_ h: Harness) async {
 
     do {
         // The counter as convenient-security measured it (scaled to a quarter-second step):
-        // waiting for the quiet period plus one step stays held while the typing goes on.
+        // steady typing reads from one step to just under two, so a threshold of two steps stays
+        // held while the typing goes on. (Production waits 1 s — two of those 0.5 s steps, on the
+        // edge given real jitter — and relies on the stray-key re-hold if the counter is stepped.)
         let step = 0.25
         let quiet = 0.25
         let started = Date()
@@ -80,8 +82,8 @@ func runInteractionGraceTests(_ h: Harness) async {
         spinRunLoop(seconds: 0.85)
         h.expect(grace.phase == .live, "stepped counter: live within a step of the quiet period after typing stops")
 
-        // What waiting for the quiet period alone does: the same typing reads past it inside every
-        // step, and the chooser would go live mid-sentence.
+        // A threshold of one step: the same typing reads past it inside every step, and the
+        // chooser goes live mid-sentence.
         let restarted = Date()
         let early = InteractionGrace(
             minimumDelay: 0.1, requiredKeyboardIdle: quiet, clickQuietPeriod: 0.3,
@@ -90,7 +92,7 @@ func runInteractionGraceTests(_ h: Harness) async {
         early.begin()
         spinRunLoop(seconds: 0.3)
         h.expect(early.phase == .live,
-                 "stepped counter: without the step as margin, steady typing reads as quiet (the bug this guards)")
+                 "stepped counter: a one-step threshold reads steady typing as quiet")
         early.cancel()
     }
 
@@ -186,11 +188,10 @@ func runInteractionGraceTests(_ h: Harness) async {
     h.expect(
         InteractionGrace.minimumDelay == 0.5
             && InteractionGrace.keyboardQuietPeriod == 1.0
-            && InteractionGrace.keyboardCounterStep == 0.5
-            && InteractionGrace.requiredKeyboardIdle == 1.5
+            && InteractionGrace.requiredKeyboardIdle == 1.0
             && InteractionGrace.clickQuietPeriod == 1.0
             && InteractionGrace.clickBlockPeriod == 1.0,
-        "production: ≥0.5 s, then 1 s of keyboard quiet plus the counter's 0.5 s step, and 1 s since a click; clicks on it blocked for 1 s")
+        "production: ≥0.5 s, then 1 s of keyboard quiet and 1 s since a click; clicks on it blocked for 1 s")
     h.expect(
         InteractionGrace.focusLossHoldWindow == 2.0 && InteractionGrace.userActionWindow == 1.0,
         "production: losing focus within 2 s of going live holds it again; later, only a click or key in the last 1 s cancels")

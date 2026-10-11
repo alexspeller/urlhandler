@@ -67,7 +67,7 @@ browser/profile) **or** `Chooser` (popup). It's a resident `LSUIElement` agent �
 - `Chooser.swift` — NSPanel popup (1–9 pick, ⌘C copy, esc/close cancel). Appears **held**, goes **live**
   per `InteractionGrace`, **queues** URLs that arrive while it's up (see Gotchas). `ChooserEnvironment` is the test seam.
 - `InteractionGrace.swift` — the hold's timing and every timing constant: ≥0.5 s, then until the keyboard
-  counter reads 1.5 s idle and no click elsewhere for 1 s; clicks on the chooser blocked for 1 s.
+  counter reads 1 s idle and no click elsewhere for 1 s; clicks on the chooser blocked for 1 s.
   Ported from convenient-security's `PromptInteractionGrace`.
 - `Router.swift` — orchestration; builds `ctx`; chooser/default fallbacks on error or unknown key.
 - `Defaults.swift` — embedded default `config.json` + `rules.js`, seeded on first run. **Keep in sync with the live files.**
@@ -102,7 +102,9 @@ menu bar + `agent.log`). **When changing default behavior, update the live files
   back into the user's window dismissed it — ~17% of choosers ended with nothing opened, many re-clicked.
   Now it's ordered front **without** key/activation (held: rows dimmed, keys go to the user's app, clicks
   elsewhere can't dismiss it) and goes live after `InteractionGrace` — min 0.5 s, then keyboard counter
-  (`CGEventSource.secondsSinceLastEventType`, no TCC grant) ≥ 1.5 s idle, and 1 s since the last click
+  (`CGEventSource.secondsSinceLastEventType`, no TCC grant) ≥ 1 s idle (per-key on this Mac; csec once
+  measured 0.5 s steps and waits 1.5 s — a stepped counter could let it go live mid-sentence, which the
+  stray-key re-hold below catches), and 1 s since the last click
   in another app (a global mouse monitor — needs no TCC grant; global *key* monitors do, so keys use the
   counter). **Clicks on the chooser (rows, close button) do nothing for 1 s after it appears or is held
   again** — in-flight clicks land on whatever it appeared over; after that a click engages it at once.

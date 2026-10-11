@@ -34,17 +34,16 @@ public final class InteractionGrace: NSObject {
     /// typing into their own window.
     nonisolated public static let keyboardQuietPeriod: TimeInterval = 1.0
 
-    /// How coarsely the session's keyboard counter may see key presses. convenient-security
-    /// measured it publishing in half-second steps, each dated to the start of its step, so
-    /// steady typing read anything up to just over a second; a probe of the same Mac on
-    /// 2026-10-11 saw every key within 5 ms. Waiting out one step as margin is right either way:
-    /// with a precise counter it only means going live 1.5 s after the last key instead of 1 s.
-    nonisolated public static let keyboardCounterStep: TimeInterval = 0.5
-
-    /// The counter reading the grace waits for: the quiet period plus one step, which steady
-    /// typing never reaches even on a stepped counter.
-    nonisolated public static let requiredKeyboardIdle: TimeInterval =
-        keyboardQuietPeriod + keyboardCounterStep
+    /// The counter reading the grace waits for: the quiet period itself, trusting the counter to
+    /// see each key — a probe of this Mac on 2026-10-11 saw every key published within 5 ms, so
+    /// the chooser goes live 1 s after the last key.
+    ///
+    /// convenient-security once measured the counter publishing in half-second steps, each key
+    /// dated to the start of its step, so steady typing read anything up to just over a second;
+    /// it waits 1.5 s (quiet plus a step) because a 1 s threshold is then crossed mid-sentence.
+    /// Here that would only make the chooser go live while someone is still typing, and their
+    /// next key is stray and holds it again (`Chooser`), so the wait stays at 1 s.
+    nonisolated public static let requiredKeyboardIdle: TimeInterval = keyboardQuietPeriod
 
     /// How long since the last click in another app before the chooser takes focus. Clicks
     /// are seen exactly (a global mouse monitor, `Chooser`), and only those after the chooser
