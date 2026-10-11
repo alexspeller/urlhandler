@@ -24,7 +24,9 @@ public enum ChooserAction: Equatable {
     case copy
     case cancel
     case select(Int)
-    case ignore
+    /// Not a chooser key — a letter, space, Tab, an out-of-range digit, ⌘ + anything but C. The
+    /// human is typing for another window and hasn't noticed the chooser.
+    case stray
 }
 
 /// Maps a key event to a chooser action. `characters` is `charactersIgnoringModifiers`.
@@ -36,7 +38,7 @@ public func chooserKeyAction(
     selected: Int
 ) -> ChooserAction {
     if command {
-        return characters?.lowercased() == "c" ? .copy : .ignore
+        return characters?.lowercased() == "c" ? .copy : .stray
     }
     switch keyCode {
     case 53: return .cancel                                   // esc
@@ -48,7 +50,7 @@ public func chooserKeyAction(
     if let characters, let n = Int(characters), n >= 1, n <= optionsCount {
         return .pick(n - 1)
     }
-    return .ignore
+    return .stray
 }
 
 @MainActor
@@ -56,6 +58,8 @@ final class ChooserModel: ObservableObject {
     let url: String
     let options: [ChooserOption]
     @Published var selected: Int = 0
+    /// False while the chooser is held back from input (`InteractionGrace`).
+    @Published var live = false
     var onPick: (Int) -> Void = { _ in }
 
     init(url: String, options: [ChooserOption]) {
@@ -64,28 +68,117 @@ final class ChooserModel: ObservableObject {
     }
 }
 
+/// What the chooser needs from the system. Production uses `.production`; the self-test injects
+/// clocks and recorders so it can drive a real chooser without putting a window in front of the
+/// developer or taking their focus.
+public struct ChooserEnvironment {
+    public var minimumDelay: TimeInterval = InteractionGrace.minimumDelay
+    /// Doubled after each re-hold (see `Chooser`).
+    public var requiredKeyboardIdle: TimeInterval = InteractionGrace.requiredKeyboardIdle
+    public var clickQuietPeriod: TimeInterval = InteractionGrace.clickQuietPeriod
+    public var keyboardIdle: () -> TimeInterval = InteractionGrace.secondsSinceLastKeyPress
+    public var now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    /// Put the panel on screen without making it key or activating this app, so keystrokes keep
+    /// flowing to whatever the human was typing into.
+    public var show: @MainActor (NSPanel) -> Void = { panel in
+        Chooser.centerOnCursorScreen(panel)
+        panel.orderFront(nil)  // documented to change neither the key nor the main window
+    }
+    /// Bring this app forward and make the panel key: the chooser going live.
+    public var takeFocus: @MainActor (NSPanel) -> Void = { panel in
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+    /// Give the focus back to the app the human was typing into.
+    public var returnFocus: @MainActor (NSRunningApplication?) -> Void = { app in
+        guard let app else {
+            NSApp.deactivate()
+            return
+        }
+        if #available(macOS 14.0, *) {
+            // Cooperative activation: the active app (us) yields, then the target activates.
+            NSApp.yieldActivation(to: app)
+            app.activate(from: NSRunningApplication.current, options: [])
+        } else {
+            app.activate(options: [])
+        }
+    }
+    /// The app the human is in, other than this one.
+    public var frontmostApplication: @MainActor () -> NSRunningApplication? = {
+        guard let app = NSWorkspace.shared.frontmostApplication, app != NSRunningApplication.current
+        else { return nil }
+        return app
+    }
+    /// Call `handler` for every mouse button pressed in another app until the returned closure
+    /// is called. A global mouse monitor needs no Accessibility or Input Monitoring grant (only
+    /// key monitors do); checked from an ad-hoc signed app with neither.
+    public var watchClicksElsewhere: @MainActor (@escaping @MainActor () -> Void) -> @MainActor () -> Void = { handler in
+        let monitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { _ in
+            MainActor.assumeIsolated { handler() }
+        }
+        return { if let monitor { NSEvent.removeMonitor(monitor) } }
+    }
+
+    public static var production: ChooserEnvironment { ChooserEnvironment() }
+
+    public init() {}
+}
+
 /// A small, keyboard-driven popup for choosing a browser when routing is ambiguous.
 /// Number keys pick, ⌘C copies the URL, esc cancels, arrows + return move/confirm.
+///
+/// It appears **held**: in front, but not key and with this app not activated, so a human who is
+/// typing or clicking elsewhere carries on undisturbed — their keys go to their own window and
+/// a click elsewhere cannot dismiss it. It goes **live** (activates, takes the keyboard, and from
+/// then on clicking away cancels) when `InteractionGrace` says the human has paused, or at once
+/// when they click it. A live chooser that receives a key that isn't one of its own (a letter,
+/// space…) concludes the human is still typing for another window: it hands the focus back and
+/// is held again (that key is lost — it can't be re-sent without Accessibility), and each such
+/// re-hold doubles the keyboard quiet it waits for, so a writer pausing between sentences isn't
+/// interrupted every time.
 @MainActor
 public final class Chooser: NSObject, NSWindowDelegate {
+    public enum State: Equatable {
+        case idle, held, live
+    }
+
+    public private(set) var state = State.idle
+    /// The panel while one is presented.
+    public var window: NSPanel? { panel }
+
+    private let environment: ChooserEnvironment
+    private let log: JSEngine.Logger
     private var panel: NSPanel?
-    private var monitor: Any?
+    private var keyMonitor: Any?
+    private var stopWatchingClicks: (() -> Void)?
     private var model: ChooserModel?
     private var onSelect: ((ChooserOption) -> Void)?
-    private var armed = false  // becomes true once the panel is key, so setup doesn't self-dismiss
+    private var grace: InteractionGrace?
+    /// Live and key: losing key now means the human clicked away.
+    private var armed = false
+    private var reholds = 0
+    private var returnTo: NSRunningApplication?
+    private var shownAt: TimeInterval = 0
+    private var liveAt: TimeInterval?
 
-    public override init() { super.init() }
+    public init(environment: ChooserEnvironment = .production, log: @escaping JSEngine.Logger = { _, _ in }) {
+        self.environment = environment
+        self.log = log
+        super.init()
+    }
 
     public func present(
         url: String,
         options: [ChooserOption],
         onSelect: @escaping (ChooserOption) -> Void
     ) {
-        dismiss()
+        if state != .idle { end("replaced by a new URL before a choice; not opened: \(model?.url ?? "?")", level: "warn") }
         guard !options.isEmpty else { return }
 
         let model = ChooserModel(url: url, options: options)
-        model.onPick = { [weak self] index in self?.pick(index) }
+        model.onPick = { [weak self] index in self?.rowClicked(index) }
         self.model = model
         self.onSelect = onSelect
 
@@ -106,22 +199,37 @@ public final class Chooser: NSObject, NSWindowDelegate {
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        Chooser.centerOnCursorScreen(panel)
         panel.delegate = self
         self.panel = panel
+
+        state = .held
         armed = false
+        reholds = 0
+        liveAt = nil
+        shownAt = environment.now()
+        returnTo = environment.frontmostApplication()
+        environment.show(panel)
 
-        NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
-
-        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
-            return self.handle(event) ? nil : event
+            return self.handle(keyDown: event) ? nil : event
         }
+        stopWatchingClicks = environment.watchClicksElsewhere { [weak self] in
+            self?.grace?.clickedElsewhere()
+        }
+        startGrace()
     }
 
-    private func handle(_ event: NSEvent) -> Bool {
-        guard let model else { return false }
+    /// What the chooser does with a key press that reaches it; true if it consumed the key.
+    @discardableResult
+    public func handle(keyDown event: NSEvent) -> Bool {
+        guard let model, state != .idle else { return false }
+        if state == .held {
+            // Only reachable when the panel was made key by a click inside the minimum delay and
+            // the human is typing: no key is a choice yet, and the focus goes back where it was.
+            environment.returnFocus(returnTo)
+            return true
+        }
         let action = chooserKeyAction(
             keyCode: event.keyCode,
             characters: event.charactersIgnoringModifiers,
@@ -130,20 +238,80 @@ public final class Chooser: NSObject, NSWindowDelegate {
             selected: model.selected
         )
         switch action {
-        case .pick(let index): pick(index)
+        case .pick(let index): pick(index, via: "key")
         case .copy: copyURL()
-        case .cancel: dismiss()
+        case .cancel: end("cancelled by esc")
         case .select(let index): model.selected = index
-        case .ignore: return false
+        case .stray: rehold()
         }
         return true
     }
 
-    private func pick(_ index: Int) {
+    /// What a click on row `index` does: picks it when live. A held chooser takes the click as
+    /// the human engaging with it, past the minimum delay.
+    public func rowClicked(_ index: Int) {
+        if state == .held { grace?.engage() }
+        guard state == .live else { return }
+        pick(index, via: "click")
+    }
+
+    /// Cancels the chooser without opening anything.
+    public func dismiss() {
+        guard state != .idle else { return }
+        end("dismissed")
+    }
+
+    private func startGrace() {
+        grace?.cancel()
+        let grace = InteractionGrace(
+            minimumDelay: environment.minimumDelay,
+            requiredKeyboardIdle: requiredKeyboardIdle,
+            clickQuietPeriod: environment.clickQuietPeriod,
+            keyboardIdle: environment.keyboardIdle,
+            now: environment.now,
+            onLive: { [weak self] in self?.goLive() }
+        )
+        self.grace = grace
+        grace.begin()
+    }
+
+    private var requiredKeyboardIdle: TimeInterval {
+        environment.requiredKeyboardIdle * pow(2, Double(reholds))
+    }
+
+    private func goLive() {
+        guard state == .held, let panel, let model else { return }
+        state = .live
+        liveAt = environment.now()
+        model.live = true
+        var held: [String] = []
+        if grace?.heldForTyping == true { held.append("typing") }
+        if grace?.heldForClicks == true { held.append("clicks elsewhere") }
+        log("info", "chooser live at \(elapsed()) (held for \(held.isEmpty ? "nothing" : held.joined(separator: " and ")))")
+        // The human may have clicked into another app while it was held; that's where they'll
+        // want the focus back if they turn out to be typing.
+        if let frontmost = environment.frontmostApplication() { returnTo = frontmost }
+        environment.takeFocus(panel)
+        if panel.isKeyWindow { armed = true }
+    }
+
+    private func rehold() {
+        reholds += 1
+        state = .held
+        armed = false
+        liveAt = nil
+        model?.live = false
+        log("info", "chooser held again at \(elapsed()): a key not meant for it; now waits for "
+            + String(format: "%.1f", requiredKeyboardIdle) + " s of keyboard quiet")
+        environment.returnFocus(returnTo)
+        startGrace()
+    }
+
+    private func pick(_ index: Int, via: String) {
         guard let model, model.options.indices.contains(index) else { return }
         let option = model.options[index]
         let callback = onSelect
-        dismiss()
+        end("picked \(option.key) by \(via)")
         callback?(option)
     }
 
@@ -151,24 +319,37 @@ public final class Chooser: NSObject, NSWindowDelegate {
         guard let model else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(model.url, forType: .string)
-        dismiss()
+        end("copied the URL")
     }
 
-    public func dismiss() {
+    /// Logs how the chooser ended and tears it down.
+    private func end(_ outcome: String, level: String = "info") {
+        let live = liveAt.map { " (live at \(milliseconds($0 - shownAt)))" } ?? " (never live)"
+        log(level, "chooser \(outcome) at \(elapsed())\(live)")
+        state = .idle
         armed = false
-        if let monitor { NSEvent.removeMonitor(monitor) }
-        monitor = nil
+        grace?.cancel()
+        grace = nil
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+        keyMonitor = nil
+        stopWatchingClicks?()
+        stopWatchingClicks = nil
         panel?.delegate = nil  // avoid re-entering windowDidResignKey during our own teardown
         panel?.orderOut(nil)
         panel = nil
         model = nil
         onSelect = nil
+        returnTo = nil
     }
+
+    private func elapsed() -> String { milliseconds(environment.now() - shownAt) }
+
+    private func milliseconds(_ seconds: TimeInterval) -> String { "\(Int((seconds * 1000).rounded())) ms" }
 
     /// Centers `panel` on whichever screen currently contains the mouse cursor, so the chooser
     /// appears on the display the user is actively pointing at (multi-monitor). Falls back to the
     /// main screen, then to AppKit's default centering, if the cursor isn't over any known screen.
-    static func centerOnCursorScreen(_ panel: NSPanel) {
+    public static func centerOnCursorScreen(_ panel: NSPanel) {
         let mouse = NSEvent.mouseLocation  // global, bottom-left origin — same space as NSScreen.frame
         guard let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main
         else {
@@ -184,15 +365,24 @@ public final class Chooser: NSObject, NSWindowDelegate {
         ))
     }
 
-    // MARK: - NSWindowDelegate (defocus cancels)
+    // MARK: - NSWindowDelegate
 
     public func windowDidBecomeKey(_ notification: Notification) {
-        armed = true
+        switch state {
+        case .live:
+            armed = true
+        case .held:
+            // Never made key while held, so the human clicked it.
+            grace?.engage()
+        case .idle:
+            break
+        }
     }
 
     public func windowDidResignKey(_ notification: Notification) {
-        // Clicking away / switching apps cancels the open and hides the chooser.
-        if armed { dismiss() }
+        // Clicking away / switching apps cancels a live chooser. A held one never took the focus,
+        // so losing it means nothing.
+        if state == .live, armed { end("cancelled by clicking away") }
     }
 
     /// Resolves an application's icon from a name, bundle id, or path (best-effort).
@@ -244,8 +434,11 @@ private struct ChooserView: View {
                     row(index: index, option: option)
                 }
             }
+            .opacity(model.live ? 1 : 0.5)
 
-            Text("1–\(model.options.count) open · ⌘C copy · esc cancel")
+            Text(model.live
+                 ? "1–\(model.options.count) open · ⌘C copy · esc cancel"
+                 : "Waiting while you type or click elsewhere · click to choose now")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }

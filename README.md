@@ -11,7 +11,8 @@ is ambiguous it shows a small keyboard-driven chooser.
 - **Fast.** Runs as a resident background agent (`LSUIElement`), so there's no per-click launch
   cost. It can launch at login so even the first click after a reboot is instant.
 - **Chooser.** Ambiguous links open a small popup: press `1`–`9` to pick, `⌘C` to copy the URL,
-  `esc` to cancel.
+  `esc` to cancel. It won't grab your keyboard mid-sentence or vanish under a stray click: it waits,
+  dimmed, until you've stopped typing (~1.5 s) and clicking elsewhere (~1 s) — or until you click it.
 
 ## How it works
 

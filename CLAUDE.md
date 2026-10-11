@@ -7,6 +7,12 @@ Replaces loshadki **OpenIn**. Pure Swift + SwiftPM; no Xcode required.
 
 > This is a Swift/macOS project — the Ruby/JS/bundler/`httpx` guidance in the global CLAUDE.md does not apply here.
 
+## Repository policy
+This is a **personal repo**: Alex (working with Claude) is its only maintainer — no other contributors,
+no reviewers. The policy is to **always keep it pushed to `main`** so it stays backed up: commit each
+finished change straight to `main` and `git push` it. No feature branches or PRs. This overrides the
+global "branch first / commit only when asked" defaults for this repository.
+
 ## Environment
 - macOS 26, Swift 6.2 toolchain, **Command Line Tools only (no Xcode.app)**.
 - The app is **ad-hoc signed** (`codesign -s -`) — sufficient to be the default browser, receive
@@ -31,8 +37,14 @@ Tests are a **plain executable** at `Sources/urlhandler-selftest/`, run via `mak
 swift-testing (its standalone runner isn't wired up on a CLT-only macOS — `swift test` builds but
 doesn't execute). Add checks to the `run*Tests(_:)` functions; a `Harness` records pass/fail and the
 process exits non-zero on failure. The kit is a library target, so tests use the **public** API —
-prefer integration-style checks over mocking. The highest-value tests are the JSEngine async bridge
-and ConfigStore safe-reload.
+prefer integration-style checks over mocking. The highest-value tests are the JSEngine async bridge,
+ConfigStore safe-reload, and the chooser's input hold.
+
+Chooser tests drive a **real** `Chooser` through a test `ChooserEnvironment`: the panel is parked
+offscreen at alpha 0, the keyboard clock is injected, and the focus steps (`takeFocus`/`returnFocus`)
+are recorders — so the suite never shows a window, activates the process, or reads the developer's
+own typing. Keep it that way. Timings are scaled down (0.1 s / 0.25 s); the suite is stable under full
+CPU load. Never test ⌘C — it would overwrite the developer's clipboard.
 
 ## Architecture
 SwiftPM package, three targets:
@@ -52,7 +64,10 @@ browser/profile) **or** `Chooser` (popup). It's a resident `LSUIElement` agent �
 - `Config.swift` — JSON models (+ a comment-stripping pre-pass).
 - `Resolver.swift` — async URLSession redirect follower backing `resolve()` (HEAD→GET fallback, hard timeout).
 - `Launcher.swift` — builds/runs the `open` command per browser/profile; re-activates the browser after a profile launch.
-- `Chooser.swift` — NSPanel popup (1–9 pick, ⌘C copy, esc/defocus cancel). The pure `chooserKeyAction(...)` is unit-tested.
+- `Chooser.swift` — NSPanel popup (1–9 pick, ⌘C copy, esc cancel; clicking away cancels only once live).
+  Appears **held** and goes **live** per `InteractionGrace` (see Gotchas). `ChooserEnvironment` is the test seam.
+- `InteractionGrace.swift` — the hold's timing: ≥0.5 s, then until the keyboard counter reads 1.5 s idle
+  and no click elsewhere for 1 s. Ported from convenient-security's `PromptInteractionGrace`.
 - `Router.swift` — orchestration; builds `ctx`; chooser/default fallbacks on error or unknown key.
 - `Defaults.swift` — embedded default `config.json` + `rules.js`, seeded on first run. **Keep in sync with the live files.**
 - `ChromeProfiles.swift` (Local State parsing), `LoginItem.swift`, `StatusItemController.swift`, `Logging.swift`, `CLI.swift`.
@@ -81,6 +96,17 @@ menu bar + `agent.log`). **When changing default behavior, update the live files
 - **Two delegate paths, kept separate:** `http`/`https` arrive via the GetURL Apple Event (carries the
   opener PID → `ctx.opener`); local HTML files arrive via `application(_:openFiles:)`. Do **not** implement
   `application(_:openURLs:)` — it would also receive `http`/`https` and double-handle (and drop the opener).
+- **The chooser must never take focus from someone mid-typing or mid-clicking.** Before this, it
+  activated instantly: the next Return/digit of a sentence picked a browser, Esc cancelled, and the click
+  back into the user's window dismissed it — ~17% of choosers ended with nothing opened, many re-clicked.
+  Now it's ordered front **without** key/activation (held: rows dimmed, keys go to the user's app, clicks
+  elsewhere can't dismiss it) and goes live after `InteractionGrace` — min 0.5 s, then keyboard counter
+  (`CGEventSource.secondsSinceLastEventType`, no TCC grant) ≥ 1.5 s idle, and 1 s since the last click
+  in another app (a global mouse monitor — needs no TCC grant; global *key* monitors do, so keys use the
+  counter). A click on the chooser past 0.5 s engages it at once. A **stray key while live** (letter, space,
+  ⌘+other…) hands focus back to the previous app and re-holds, doubling the keyboard quiet each time; that
+  key is lost (re-sending needs Accessibility). Every outcome is logged with ms timings
+  (`chooser live at …`, `picked … by key|click`, `cancelled by esc|clicking away`, `held again`).
 - `set-default` / `login-item` must run from the installed `.app` (they use `Bundle.main.bundleURL`); the
   Makefile targets invoke the installed binary.
 

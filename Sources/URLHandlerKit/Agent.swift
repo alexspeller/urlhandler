@@ -9,7 +9,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var store: ConfigStore?
     private var router: Router?
     private var statusController: StatusItemController?
-    private let chooser = Chooser()
+    private lazy var chooser = Chooser(log: log)
     private let log = combineLoggers(
         makeOSLogger(),
         makeFileLogger(at: ConfigStore.defaultDirectory.appendingPathComponent("agent.log"))
