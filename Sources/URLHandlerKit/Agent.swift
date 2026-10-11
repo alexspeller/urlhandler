@@ -99,7 +99,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        log("info", "showing chooser for \(url) with \(options.count) options")
         chooser.present(url: url, options: options) { [weak self] option in
             self?.router?.launch(browser: option.browser, key: option.key, url: url)
         }

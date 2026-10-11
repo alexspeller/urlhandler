@@ -66,16 +66,27 @@ func runChooserTests(_ h: Harness) async {
 private final class RigState {
     /// When a key last went down; nil reads as an hour ago.
     var lastKey: Date?
+    /// When a mouse button last went down anywhere (the session counter); nil reads as an hour ago.
+    var lastClick: Date?
     var alwaysTyping = false
     var focusTaken = 0
     var focusReturned = 0
     var clickHandler: (@MainActor () -> Void)?
     var logs: [String] = []
+    /// "url → browser key" for every pick.
     var picked: [String] = []
 
     var keyboardIdle: TimeInterval {
         if alwaysTyping { return 0 }
         return lastKey.map { Date().timeIntervalSince($0) } ?? 3600
+    }
+
+    var mouseIdle: TimeInterval { lastClick.map { Date().timeIntervalSince($0) } ?? 3600 }
+
+    /// A click in another app, as both the counter and the global monitor see it.
+    func clickElsewhere() {
+        lastClick = Date()
+        clickHandler?()
     }
 }
 
@@ -92,14 +103,20 @@ private final class ChooserRig {
         ChooserOption(key: "safari", browser: BrowserConfig(app: "Safari"), icon: nil),
     ]
 
-    /// Timings scaled down from production: 0.1 s minimum, 0.25 s keyboard quiet, 0.25 s since a click.
+    /// Timings scaled down from production: 0.1 s minimum, 0.25 s keyboard and mouse quiet, clicks
+    /// on it blocked for 0.2 s, focus lost within 0.3 s of going live holds it again, and a click
+    /// or key within 0.2 s counts as the human causing a focus loss.
     init() {
         let state = self.state
         var env = ChooserEnvironment()
         env.minimumDelay = 0.1
         env.requiredKeyboardIdle = 0.25
         env.clickQuietPeriod = 0.25
+        env.clickBlockPeriod = 0.2
+        env.focusLossHoldWindow = 0.3
+        env.userActionWindow = 0.2
         env.keyboardIdle = { MainActor.assumeIsolated { state.keyboardIdle } }
+        env.mouseIdle = { MainActor.assumeIsolated { state.mouseIdle } }
         env.show = { panel in
             panel.alphaValue = 0
             panel.setFrameOrigin(NSPoint(x: -20_000, y: -20_000))
@@ -119,7 +136,7 @@ private final class ChooserRig {
 
     func present(_ url: String = "https://example.com/a") {
         let state = self.state
-        chooser.present(url: url, options: options) { option in state.picked.append(option.key) }
+        chooser.present(url: url, options: options) { option in state.picked.append("\(url) → \(option.key)") }
     }
 
     /// A key going down, delivered as the chooser's key monitor delivers it.
@@ -141,6 +158,13 @@ private final class ChooserRig {
         chooser.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: chooser.window))
     }
 
+    /// The close button: AppKit asks the delegate, then closes.
+    func clickCloseButton() -> Bool {
+        guard let window = chooser.window, chooser.windowShouldClose(window) else { return false }
+        chooser.windowWillClose(Notification(name: NSWindow.willCloseNotification, object: window))
+        return true
+    }
+
     func logged(_ fragment: String) -> Bool { state.logs.contains { $0.contains(fragment) } }
 
     func tearDown() { chooser.dismiss() }
@@ -150,6 +174,7 @@ private final class ChooserRig {
 private func runChooserHoldTests(_ h: Harness) async {
     h.suite("Chooser — held while the human is busy, live once they pause")
     NSApplication.shared.setActivationPolicy(.accessory)
+    let a = "https://example.com/a"
 
     do {
         // Typing as it appears: it shows without focus, and the typing goes on undisturbed.
@@ -170,7 +195,7 @@ private func runChooserHoldTests(_ h: Harness) async {
         spinRunLoop(seconds: 0.4)
         h.expect(rig.chooser.state == .live && rig.state.focusTaken == 1, "typing: live and focused once the typing stops")
         h.expect(rig.logged("chooser live at") && rig.logged("held for typing"), "typing: the log says it was held for typing")
-        h.expect(rig.press("2", keyCode: 19) && rig.state.picked == ["dexory"], "typing: a digit picks once live")
+        h.expect(rig.press("2", keyCode: 19) && rig.state.picked == ["\(a) → dexory"], "typing: a digit picks once live")
         h.expect(rig.chooser.state == .idle && rig.chooser.window == nil, "typing: the chooser is gone after a pick")
         h.expect(rig.logged("picked dexory by key"), "typing: the log records the pick and how")
         h.expect(rig.state.clickHandler == nil, "typing: the click watcher is stopped with the chooser")
@@ -181,33 +206,69 @@ private func runChooserHoldTests(_ h: Harness) async {
         let rig = ChooserRig()
         rig.present()
         spinRunLoop(seconds: 0.2)
-        h.expect(rig.chooser.state == .live, "re-hold: live at the minimum delay when nobody is typing")
+        h.expect(rig.chooser.state == .live, "stray key: live at the minimum delay when nobody is typing")
         rig.state.lastKey = Date()
-        h.expect(rig.press("h", keyCode: 4), "re-hold: the stray key is swallowed, not beeped")
+        h.expect(rig.press("h", keyCode: 4), "stray key: swallowed, not beeped")
         h.expect(rig.chooser.state == .held && rig.state.focusReturned == 1 && rig.state.picked.isEmpty,
-                 "re-hold: focus goes back and the chooser is held again, nothing picked")
-        h.expect(rig.logged("held again"), "re-hold: logged")
+                 "stray key: focus goes back and the chooser is held again, nothing picked")
+        h.expect(rig.logged("held again") && rig.logged("a key not meant for it"), "stray key: logged")
         // The quiet it now waits for has doubled: 0.5 s instead of 0.25 s.
         spinRunLoop(seconds: 0.35)
-        h.expect(rig.chooser.state == .held, "re-hold: waits for twice the keyboard quiet")
+        h.expect(rig.chooser.state == .held, "stray key: waits for twice the keyboard quiet")
         spinRunLoop(seconds: 0.3)
-        h.expect(rig.chooser.state == .live && rig.state.focusTaken == 2, "re-hold: live again after the longer quiet")
+        h.expect(rig.chooser.state == .live && rig.state.focusTaken == 2, "stray key: live again after the longer quiet")
         h.expect(rig.press("\u{1b}", keyCode: 53) && rig.chooser.state == .idle && rig.state.picked.isEmpty,
-                 "re-hold: esc still cancels")
-        h.expect(rig.logged("cancelled by esc"), "re-hold: the cancel is logged")
+                 "stray key: esc still cancels")
+        h.expect(rig.logged("cancelled by esc"), "stray key: the cancel is logged")
     }
 
     do {
-        // Clicking away cancels a live chooser, never a held one.
+        // Losing focus: never matters while held; soon after going live it holds it again.
         let rig = ChooserRig()
         rig.present()
         rig.resignKey()
-        h.expect(rig.chooser.state == .held, "click away: no effect while held")
-        spinRunLoop(seconds: 0.2)
+        h.expect(rig.chooser.state == .held, "focus loss: no effect while held")
+        spinRunLoop(seconds: 0.15)
+        h.expect(rig.chooser.state == .live, "focus loss: live")
         rig.becomeKey()
+        rig.state.clickElsewhere()
         rig.resignKey()
-        h.expect(rig.chooser.state == .idle && rig.state.picked.isEmpty, "click away: cancels once live")
+        h.expect(rig.chooser.state == .held && rig.state.picked.isEmpty && rig.state.focusReturned == 0,
+                 "focus loss: a click away just after going live holds it again instead of cancelling")
+        h.expect(rig.logged("lost focus"), "focus loss: logged")
+        // Mouse quiet doubled to 0.5 s from that click.
+        spinRunLoop(seconds: 0.35)
+        h.expect(rig.chooser.state == .held, "focus loss: waits twice as long for the mouse to be quiet")
+        spinRunLoop(seconds: 0.3)
+        h.expect(rig.chooser.state == .live, "focus loss: live again once quiet")
+        rig.tearDown()
+    }
+
+    do {
+        // Later than that, clicking away is a deliberate dismissal.
+        let rig = ChooserRig()
+        rig.present()
+        spinRunLoop(seconds: 0.15)
+        rig.becomeKey()
+        spinRunLoop(seconds: 0.35)
+        rig.state.clickElsewhere()
+        rig.resignKey()
+        h.expect(rig.chooser.state == .idle && rig.state.picked.isEmpty, "click away: cancels once it's been live a while")
         h.expect(rig.logged("cancelled by clicking away"), "click away: logged")
+    }
+
+    do {
+        // ...but losing focus with no click or key from the human (the browser just picked coming
+        // forward, an app activating itself) holds it again.
+        let rig = ChooserRig()
+        rig.present()
+        spinRunLoop(seconds: 0.15)
+        rig.becomeKey()
+        spinRunLoop(seconds: 0.35)
+        rig.resignKey()
+        h.expect(rig.chooser.state == .held, "app took focus: held again, not cancelled")
+        h.expect(rig.logged("another app took focus"), "app took focus: logged")
+        rig.tearDown()
     }
 
     do {
@@ -215,7 +276,7 @@ private func runChooserHoldTests(_ h: Harness) async {
         let rig = ChooserRig()
         rig.present()
         spinRunLoop(seconds: 0.02)
-        rig.state.clickHandler?()
+        rig.state.clickElsewhere()
         spinRunLoop(seconds: 0.15)
         h.expect(rig.chooser.state == .held, "clicks: a click elsewhere holds it past the minimum delay")
         spinRunLoop(seconds: 0.25)
@@ -225,29 +286,48 @@ private func runChooserHoldTests(_ h: Harness) async {
     }
 
     do {
-        // Clicking a row: deliberate past the minimum delay, even with the keyboard busy.
+        // Clicking a row: blocked for the click block, even past the minimum delay.
         let rig = ChooserRig()
         rig.state.alwaysTyping = true
         rig.present()
         rig.chooser.rowClicked(1)
-        h.expect(rig.chooser.state == .held && rig.state.picked.isEmpty,
-                 "row click: inside the minimum delay it may be in flight, so nothing happens")
+        h.expect(rig.chooser.state == .held && rig.state.picked.isEmpty, "row click: right as it appears, nothing happens")
         spinRunLoop(seconds: 0.15)
         rig.chooser.rowClicked(1)
-        h.expect(rig.state.picked == ["dexory"] && rig.chooser.state == .idle,
-                 "row click: past the minimum delay it picks, keyboard busy or not")
+        h.expect(rig.chooser.state == .held && rig.state.picked.isEmpty,
+                 "row click: past the minimum delay but inside the click block, still nothing")
+        spinRunLoop(seconds: 0.1)
+        rig.chooser.rowClicked(1)
+        h.expect(rig.state.picked == ["\(a) → dexory"] && rig.chooser.state == .idle,
+                 "row click: after the block it picks, keyboard busy or not")
         h.expect(rig.logged("picked dexory by click"), "row click: logged")
     }
 
     do {
-        // Clicking the panel itself (it becomes key) past the minimum delay makes it live.
+        // Live early (nobody typing) doesn't lift the click block.
+        let rig = ChooserRig()
+        rig.present()
+        spinRunLoop(seconds: 0.15)
+        h.expect(rig.chooser.state == .live, "row click: live at the minimum delay")
+        rig.chooser.rowClicked(0)
+        h.expect(rig.chooser.state == .live && rig.state.picked.isEmpty,
+                 "row click: a live chooser still ignores a click inside the block")
+        rig.tearDown()
+    }
+
+    do {
+        // Clicking the panel itself (it becomes key) after the block makes it live.
         let rig = ChooserRig()
         rig.state.alwaysTyping = true
         rig.present()
         spinRunLoop(seconds: 0.15)
         rig.becomeKey()
+        h.expect(rig.chooser.state == .held && rig.state.focusTaken == 0,
+                 "engage: clicking it inside the click block doesn't make it live")
+        spinRunLoop(seconds: 0.1)
+        rig.becomeKey()
         h.expect(rig.chooser.state == .live && rig.state.focusTaken == 1,
-                 "engage: clicking the held chooser makes it live")
+                 "engage: clicking it after the block makes it live")
         rig.tearDown()
     }
 
@@ -264,14 +344,65 @@ private func runChooserHoldTests(_ h: Harness) async {
     }
 
     do {
-        // A new URL while one is up: the old one is logged so it isn't silently lost.
+        // The close button is a click like any other.
         let rig = ChooserRig()
-        rig.present("https://example.com/first")
-        rig.present("https://example.com/second")
-        h.expect(rig.logged("[warn] chooser replaced by a new URL") && rig.logged("https://example.com/first"),
-                 "replace: the dropped URL is in the log")
-        h.expect(rig.chooser.state == .held, "replace: the new chooser is held like any other")
+        rig.present()
+        h.expect(!rig.clickCloseButton() && rig.chooser.state == .held, "close: blocked inside the click block")
+        spinRunLoop(seconds: 0.25)
+        h.expect(rig.clickCloseButton() && rig.chooser.state == .idle && rig.state.picked.isEmpty,
+                 "close: closes it afterwards, opening nothing")
+        h.expect(rig.logged("chooser closed"), "close: logged")
+    }
+
+    h.suite("Chooser — URLs arriving while one is up are queued")
+
+    do {
+        let rig = ChooserRig()
+        let b = "https://example.com/b"
+        let c = "https://example.com/c"
+        rig.present(a)
+        rig.present(b)
+        h.expect(rig.chooser.state == .held && rig.chooser.queuedURLs == [b],
+                 "queue: a second URL waits behind the first")
+        h.expect(rig.logged("queued \(b) (1 waiting)"), "queue: logged")
+        rig.present(a)
+        rig.present(b)
+        h.expect(rig.chooser.queuedURLs == [b] && rig.logged("ignoring the duplicate"),
+                 "queue: a URL already up or already queued is ignored")
+        rig.present(c)
+        h.expect(rig.chooser.queuedURLs == [b, c], "queue: first in, first out")
+
+        spinRunLoop(seconds: 0.15)
+        rig.press("1", keyCode: 18)
+        h.expect(rig.state.picked == ["\(a) → personal"], "queue: the pick opens the first URL")
+        h.expect(rig.chooser.state == .held && rig.chooser.queuedURLs == [c] && rig.logged("showing chooser for \(b)"),
+                 "queue: the next URL's chooser appears at once, held afresh")
+        spinRunLoop(seconds: 0.15)
+        h.expect(rig.chooser.state == .live, "queue: and goes live like any other")
+        rig.press("\u{1b}", keyCode: 53)
+        h.expect(rig.state.picked == ["\(a) → personal"] && rig.chooser.state == .held
+                    && rig.chooser.queuedURLs.isEmpty && rig.logged("showing chooser for \(c)"),
+                 "queue: esc cancels only the current URL; the next one comes up")
+        spinRunLoop(seconds: 0.15)
+        rig.press("3", keyCode: 20)
+        h.expect(rig.state.picked == ["\(a) → personal", "\(c) → safari"] && rig.chooser.state == .idle,
+                 "queue: each URL's pick goes to its own callback")
+    }
+
+    do {
+        // Closing one shows the next; dismissing drops everything, logging what wasn't opened.
+        let rig = ChooserRig()
+        rig.present(a)
+        rig.present("https://example.com/b")
+        rig.present("https://example.com/c")
+        spinRunLoop(seconds: 0.25)
+        _ = rig.clickCloseButton()
+        h.expect(rig.chooser.state == .held && rig.chooser.queuedURLs == ["https://example.com/c"],
+                 "queue: closing one brings up the next")
         rig.tearDown()
-        h.expect(rig.chooser.state == .idle && rig.chooser.window == nil, "dismiss: tears the chooser down")
+        h.expect(rig.chooser.state == .idle && rig.chooser.window == nil && rig.chooser.queuedURLs.isEmpty,
+                 "dismiss: tears everything down")
+        h.expect(rig.logged("[warn] chooser dismissed; queued URL not opened: https://example.com/c"),
+                 "dismiss: the dropped queued URL is in the log")
     }
 }

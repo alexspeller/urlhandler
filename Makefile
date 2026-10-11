@@ -6,6 +6,9 @@ BUILD_DIR   := build
 APP         := $(BUILD_DIR)/$(APP_NAME).app
 PREFIX      ?= /Applications
 INSTALLED   := $(PREFIX)/$(APP_NAME).app
+# Matches the running agent but not any shell whose command line contains this pattern (the
+# recipe's own, or a wrapper's): "[/]" matches "/", while the pattern's own text reads "[/]".
+AGENT_RE    := [/]$(patsubst /%,%,$(INSTALLED))/Contents/MacOS/$(EXEC)
 LSREGISTER  := /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
 BIN_PATH     = $(shell swift build -c $(CONFIG) --show-bin-path)
 
@@ -51,7 +54,10 @@ login-item:
 	@"$(INSTALLED)/Contents/MacOS/$(EXEC)" login-item
 
 restart-agent:
-	@-pkill -f "$(INSTALLED)/Contents/MacOS/$(EXEC)" 2>/dev/null || true
+	@-pkill -f "$(AGENT_RE)" 2>/dev/null || true
+	@# Wait (up to 5 s) for the old agent to exit: opening the app while it's still going fails
+	@# with LaunchServices error -600 and leaves no agent running.
+	@for i in $$(seq 1 50); do pgrep -f "$(AGENT_RE)" >/dev/null || break; sleep 0.1; done
 	@open "$(INSTALLED)"
 	@echo "Relaunched agent."
 

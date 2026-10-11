@@ -64,10 +64,11 @@ browser/profile) **or** `Chooser` (popup). It's a resident `LSUIElement` agent �
 - `Config.swift` — JSON models (+ a comment-stripping pre-pass).
 - `Resolver.swift` — async URLSession redirect follower backing `resolve()` (HEAD→GET fallback, hard timeout).
 - `Launcher.swift` — builds/runs the `open` command per browser/profile; re-activates the browser after a profile launch.
-- `Chooser.swift` — NSPanel popup (1–9 pick, ⌘C copy, esc cancel; clicking away cancels only once live).
-  Appears **held** and goes **live** per `InteractionGrace` (see Gotchas). `ChooserEnvironment` is the test seam.
-- `InteractionGrace.swift` — the hold's timing: ≥0.5 s, then until the keyboard counter reads 1.5 s idle
-  and no click elsewhere for 1 s. Ported from convenient-security's `PromptInteractionGrace`.
+- `Chooser.swift` — NSPanel popup (1–9 pick, ⌘C copy, esc/close cancel). Appears **held**, goes **live**
+  per `InteractionGrace`, **queues** URLs that arrive while it's up (see Gotchas). `ChooserEnvironment` is the test seam.
+- `InteractionGrace.swift` — the hold's timing and every timing constant: ≥0.5 s, then until the keyboard
+  counter reads 1.5 s idle and no click elsewhere for 1 s; clicks on the chooser blocked for 1 s.
+  Ported from convenient-security's `PromptInteractionGrace`.
 - `Router.swift` — orchestration; builds `ctx`; chooser/default fallbacks on error or unknown key.
 - `Defaults.swift` — embedded default `config.json` + `rules.js`, seeded on first run. **Keep in sync with the live files.**
 - `ChromeProfiles.swift` (Local State parsing), `LoginItem.swift`, `StatusItemController.swift`, `Logging.swift`, `CLI.swift`.
@@ -103,10 +104,18 @@ menu bar + `agent.log`). **When changing default behavior, update the live files
   elsewhere can't dismiss it) and goes live after `InteractionGrace` — min 0.5 s, then keyboard counter
   (`CGEventSource.secondsSinceLastEventType`, no TCC grant) ≥ 1.5 s idle, and 1 s since the last click
   in another app (a global mouse monitor — needs no TCC grant; global *key* monitors do, so keys use the
-  counter). A click on the chooser past 0.5 s engages it at once. A **stray key while live** (letter, space,
-  ⌘+other…) hands focus back to the previous app and re-holds, doubling the keyboard quiet each time; that
-  key is lost (re-sending needs Accessibility). Every outcome is logged with ms timings
-  (`chooser live at …`, `picked … by key|click`, `cancelled by esc|clicking away`, `held again`).
+  counter). **Clicks on the chooser (rows, close button) do nothing for 1 s after it appears or is held
+  again** — in-flight clicks land on whatever it appeared over; after that a click engages it at once.
+  A live chooser is **held again** (keyboard and mouse quiet doubled each time) on: a **stray key** (letter,
+  space, ⌘+other… — focus goes back to the previous app; that key is lost, re-sending needs Accessibility);
+  **losing focus within 2 s of going live**; or losing focus later **without** a click/key from the human in
+  the last 1 s (another app — e.g. the browser just picked, cold-launching — took it). Only a pick, esc, ⌘C,
+  the close button, or a later deliberate click-away ends it. A re-hold seeds its click quiet from the
+  synchronous mouse counter, since the click that took the focus predates the new hold's global monitor.
+- **URLs arriving while a chooser is up are queued** (FIFO; a URL already up or queued is ignored), shown
+  `+N more`, each presented held afresh when the previous one ends. `dismiss()` drops the queue (logged).
+  Every outcome is logged with ms timings (`showing chooser for`, `queued`, `chooser live at …`,
+  `picked … by key|click`, `cancelled by esc|clicking away`, `closed`, `held again: <reason>`).
 - `set-default` / `login-item` must run from the installed `.app` (they use `Bundle.main.bundleURL`); the
   Makefile targets invoke the installed binary.
 

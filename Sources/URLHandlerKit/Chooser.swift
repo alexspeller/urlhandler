@@ -60,6 +60,8 @@ final class ChooserModel: ObservableObject {
     @Published var selected: Int = 0
     /// False while the chooser is held back from input (`InteractionGrace`).
     @Published var live = false
+    /// How many URLs are queued behind this one.
+    @Published var waiting = 0
     var onPick: (Int) -> Void = { _ in }
 
     init(url: String, options: [ChooserOption]) {
@@ -75,8 +77,13 @@ public struct ChooserEnvironment {
     public var minimumDelay: TimeInterval = InteractionGrace.minimumDelay
     /// Doubled after each re-hold (see `Chooser`).
     public var requiredKeyboardIdle: TimeInterval = InteractionGrace.requiredKeyboardIdle
+    /// Doubled after each re-hold, like `requiredKeyboardIdle`.
     public var clickQuietPeriod: TimeInterval = InteractionGrace.clickQuietPeriod
+    public var clickBlockPeriod: TimeInterval = InteractionGrace.clickBlockPeriod
+    public var focusLossHoldWindow: TimeInterval = InteractionGrace.focusLossHoldWindow
+    public var userActionWindow: TimeInterval = InteractionGrace.userActionWindow
     public var keyboardIdle: () -> TimeInterval = InteractionGrace.secondsSinceLastKeyPress
+    public var mouseIdle: () -> TimeInterval = InteractionGrace.secondsSinceLastClick
     public var now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     /// Put the panel on screen without making it key or activating this app, so keystrokes keep
     /// flowing to whatever the human was typing into.
@@ -131,13 +138,20 @@ public struct ChooserEnvironment {
 ///
 /// It appears **held**: in front, but not key and with this app not activated, so a human who is
 /// typing or clicking elsewhere carries on undisturbed — their keys go to their own window and
-/// a click elsewhere cannot dismiss it. It goes **live** (activates, takes the keyboard, and from
-/// then on clicking away cancels) when `InteractionGrace` says the human has paused, or at once
-/// when they click it. A live chooser that receives a key that isn't one of its own (a letter,
-/// space…) concludes the human is still typing for another window: it hands the focus back and
-/// is held again (that key is lost — it can't be re-sent without Accessibility), and each such
-/// re-hold doubles the keyboard quiet it waits for, so a writer pausing between sentences isn't
-/// interrupted every time.
+/// a click elsewhere cannot dismiss it. Clicks on it do nothing for `clickBlockPeriod`. It goes
+/// **live** (activates and takes the keyboard) when `InteractionGrace` says the human has paused,
+/// or when they click it after the block.
+///
+/// A live chooser is **held again** — dimmed, waiting twice as long for quiet each time, so a
+/// writer pausing between sentences isn't interrupted every time — when it gets a key that isn't
+/// one of its own (a letter, space…: the human is still typing for another window, so the focus
+/// goes back there; that key is lost, as re-sending it needs Accessibility), when it loses focus
+/// within `focusLossHoldWindow` of going live (they hadn't seen it), or when it loses focus later
+/// without the human clicking or pressing a key (another app took it). Only a pick, esc, ⌘C, its
+/// close button, or clicking away later than that ends it.
+///
+/// URLs that arrive while a chooser is up are **queued** (first in, first out; a URL already up or
+/// queued is ignored) and each gets its own chooser, held afresh, when the one before it ends.
 @MainActor
 public final class Chooser: NSObject, NSWindowDelegate {
     public enum State: Equatable {
@@ -162,6 +176,16 @@ public final class Chooser: NSObject, NSWindowDelegate {
     private var returnTo: NSRunningApplication?
     private var shownAt: TimeInterval = 0
     private var liveAt: TimeInterval?
+    private var queue: [Request] = []
+
+    private struct Request {
+        let url: String
+        let options: [ChooserOption]
+        let onSelect: (ChooserOption) -> Void
+    }
+
+    /// URLs waiting behind the current chooser, oldest first.
+    public var queuedURLs: [String] { queue.map(\.url) }
 
     public init(environment: ChooserEnvironment = .production, log: @escaping JSEngine.Logger = { _, _ in }) {
         self.environment = environment
@@ -169,18 +193,34 @@ public final class Chooser: NSObject, NSWindowDelegate {
         super.init()
     }
 
+    /// Shows a chooser for `url`, or queues it behind the one already up.
     public func present(
         url: String,
         options: [ChooserOption],
         onSelect: @escaping (ChooserOption) -> Void
     ) {
-        if state != .idle { end("replaced by a new URL before a choice; not opened: \(model?.url ?? "?")", level: "warn") }
         guard !options.isEmpty else { return }
+        let request = Request(url: url, options: options, onSelect: onSelect)
+        guard state == .idle else {
+            if model?.url == url || queue.contains(where: { $0.url == url }) {
+                log("info", "chooser already has \(url); ignoring the duplicate")
+                return
+            }
+            queue.append(request)
+            model?.waiting = queue.count
+            log("info", "chooser busy; queued \(url) (\(queue.count) waiting)")
+            return
+        }
+        show(request)
+    }
 
-        let model = ChooserModel(url: url, options: options)
+    private func show(_ request: Request) {
+        log("info", "showing chooser for \(request.url) with \(request.options.count) options")
+        let model = ChooserModel(url: request.url, options: request.options)
+        model.waiting = queue.count
         model.onPick = { [weak self] index in self?.rowClicked(index) }
         self.model = model
-        self.onSelect = onSelect
+        self.onSelect = request.onSelect
 
         let hosting = NSHostingView(rootView: ChooserView(model: model))
         hosting.layout()
@@ -225,7 +265,7 @@ public final class Chooser: NSObject, NSWindowDelegate {
     public func handle(keyDown event: NSEvent) -> Bool {
         guard let model, state != .idle else { return false }
         if state == .held {
-            // Only reachable when the panel was made key by a click inside the minimum delay and
+            // Only reachable when the panel was made key by a click inside the click block and
             // the human is typing: no key is a choice yet, and the focus goes back where it was.
             environment.returnFocus(returnTo)
             return true
@@ -242,21 +282,25 @@ public final class Chooser: NSObject, NSWindowDelegate {
         case .copy: copyURL()
         case .cancel: end("cancelled by esc")
         case .select(let index): model.selected = index
-        case .stray: rehold()
+        case .stray: holdAgain("a key not meant for it", returningFocus: true)
         }
         return true
     }
 
-    /// What a click on row `index` does: picks it when live. A held chooser takes the click as
-    /// the human engaging with it, past the minimum delay.
+    /// What a click on row `index` does. Nothing for `clickBlockPeriod` after the chooser
+    /// appeared or was held again — the click may have been in flight; after that, a held chooser
+    /// takes it as the human engaging with it, and a live one picks the row.
     public func rowClicked(_ index: Int) {
+        guard grace?.acceptsClicks == true else { return }
         if state == .held { grace?.engage() }
         guard state == .live else { return }
         pick(index, via: "click")
     }
 
-    /// Cancels the chooser without opening anything.
+    /// Cancels the chooser and everything queued behind it, without opening anything.
     public func dismiss() {
+        for request in queue { log("warn", "chooser dismissed; queued URL not opened: \(request.url)") }
+        queue.removeAll()
         guard state != .idle else { return }
         end("dismissed")
     }
@@ -266,7 +310,8 @@ public final class Chooser: NSObject, NSWindowDelegate {
         let grace = InteractionGrace(
             minimumDelay: environment.minimumDelay,
             requiredKeyboardIdle: requiredKeyboardIdle,
-            clickQuietPeriod: environment.clickQuietPeriod,
+            clickQuietPeriod: clickQuietPeriod,
+            clickBlockPeriod: environment.clickBlockPeriod,
             keyboardIdle: environment.keyboardIdle,
             now: environment.now,
             onLive: { [weak self] in self?.goLive() }
@@ -275,9 +320,10 @@ public final class Chooser: NSObject, NSWindowDelegate {
         grace.begin()
     }
 
-    private var requiredKeyboardIdle: TimeInterval {
-        environment.requiredKeyboardIdle * pow(2, Double(reholds))
-    }
+    /// Each time the chooser is held again it waits twice as long for quiet.
+    private var backoff: Double { pow(2, Double(reholds)) }
+    private var requiredKeyboardIdle: TimeInterval { environment.requiredKeyboardIdle * backoff }
+    private var clickQuietPeriod: TimeInterval { environment.clickQuietPeriod * backoff }
 
     private func goLive() {
         guard state == .held, let panel, let model else { return }
@@ -295,16 +341,29 @@ public final class Chooser: NSObject, NSWindowDelegate {
         if panel.isKeyWindow { armed = true }
     }
 
-    private func rehold() {
+    /// Back to held: dimmed, acting on nothing, waiting (twice as long as last time) for quiet.
+    private func holdAgain(_ reason: String, returningFocus: Bool) {
         reholds += 1
         state = .held
         armed = false
         liveAt = nil
         model?.live = false
-        log("info", "chooser held again at \(elapsed()): a key not meant for it; now waits for "
-            + String(format: "%.1f", requiredKeyboardIdle) + " s of keyboard quiet")
-        environment.returnFocus(returnTo)
+        log("info", "chooser held again at \(elapsed()): \(reason); now waits for "
+            + String(format: "%.1f s of keyboard and %.1f s of mouse quiet", requiredKeyboardIdle, clickQuietPeriod))
+        if returningFocus { environment.returnFocus(returnTo) }
         startGrace()
+        // The click that took the focus (if that's what happened) came just before this hold
+        // began, so the hold's own click watching never saw it: count it, or the chooser would
+        // take the focus straight back from someone still clicking around.
+        grace?.clickedElsewhere(secondsAgo: environment.mouseIdle())
+    }
+
+    /// Whether the human clicked or pressed a key (⌘Tab…) just now, i.e. caused a focus loss.
+    private var humanActedJustNow: Bool {
+        func recent(_ idle: TimeInterval) -> Bool {
+            idle.isFinite && idle >= 0 && idle < environment.userActionWindow
+        }
+        return recent(environment.mouseIdle()) || recent(environment.keyboardIdle())
     }
 
     private func pick(_ index: Int, via: String) {
@@ -322,7 +381,7 @@ public final class Chooser: NSObject, NSWindowDelegate {
         end("copied the URL")
     }
 
-    /// Logs how the chooser ended and tears it down.
+    /// Logs how the chooser ended, tears it down, and shows the next queued URL.
     private func end(_ outcome: String, level: String = "info") {
         let live = liveAt.map { " (live at \(milliseconds($0 - shownAt)))" } ?? " (never live)"
         log(level, "chooser \(outcome) at \(elapsed())\(live)")
@@ -340,6 +399,7 @@ public final class Chooser: NSObject, NSWindowDelegate {
         model = nil
         onSelect = nil
         returnTo = nil
+        if !queue.isEmpty { show(queue.removeFirst()) }
     }
 
     private func elapsed() -> String { milliseconds(environment.now() - shownAt) }
@@ -380,9 +440,26 @@ public final class Chooser: NSObject, NSWindowDelegate {
     }
 
     public func windowDidResignKey(_ notification: Notification) {
-        // Clicking away / switching apps cancels a live chooser. A held one never took the focus,
-        // so losing it means nothing.
-        if state == .live, armed { end("cancelled by clicking away") }
+        // A held chooser never took the focus, so losing it means nothing.
+        guard state == .live, armed, let liveAt else { return }
+        let liveFor = environment.now() - liveAt
+        if liveFor < environment.focusLossHoldWindow {
+            holdAgain("lost focus \(milliseconds(liveFor)) after going live", returningFocus: false)
+        } else if humanActedJustNow {
+            end("cancelled by clicking away")
+        } else {
+            holdAgain("another app took focus", returningFocus: false)
+        }
+    }
+
+    /// The close button, which is blocked like any other click for `clickBlockPeriod`.
+    public func windowShouldClose(_ sender: NSWindow) -> Bool {
+        grace?.acceptsClicks ?? true
+    }
+
+    public func windowWillClose(_ notification: Notification) {
+        guard state != .idle else { return }
+        end("closed")
     }
 
     /// Resolves an application's icon from a name, bundle id, or path (best-effort).
@@ -423,11 +500,20 @@ private struct ChooserView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(model.url)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            HStack(spacing: 6) {
+                Text(model.url)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if model.waiting > 0 {
+                    Spacer(minLength: 0)
+                    Text("+\(model.waiting) more")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                }
+            }
 
             VStack(spacing: 2) {
                 ForEach(Array(model.options.enumerated()), id: \.element.id) { index, option in

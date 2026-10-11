@@ -132,22 +132,41 @@ func runInteractionGraceTests(_ h: Harness) async {
     }
 
     do {
-        // Clicking the chooser itself: inside the minimum delay it may have been in flight; past
-        // it, it's deliberate and beats a busy keyboard.
+        // Clicking the chooser itself: blocked for the click block, even past the minimum delay,
+        // since it may have been in flight; after it, deliberate, and it beats a busy keyboard.
         var lives = 0
         let grace = InteractionGrace(
-            minimumDelay: 0.15, requiredKeyboardIdle: 0.4, clickQuietPeriod: 0.3,
+            minimumDelay: 0.1, requiredKeyboardIdle: 0.4, clickQuietPeriod: 0.3, clickBlockPeriod: 0.3,
             keyboardIdle: { 0 }, onLive: { lives += 1 })
+        h.expect(!grace.acceptsClicks, "engage: no clicks before it has begun")
         grace.begin()
         spinRunLoop(seconds: 0.05)
-        h.expect(!grace.engage() && grace.phase == .waiting, "engage: a click inside the minimum delay doesn't make it live")
-        spinRunLoop(seconds: 0.15)
+        h.expect(!grace.acceptsClicks && !grace.engage() && grace.phase == .waiting,
+                 "engage: a click inside the minimum delay doesn't make it live")
+        spinRunLoop(seconds: 0.12)
+        h.expect(!grace.acceptsClicks && !grace.engage() && grace.phase == .waiting,
+                 "engage: past the minimum delay but inside the click block, a click still does nothing")
+        spinRunLoop(seconds: 0.18)
         h.expect(grace.phase == .waiting, "engage: a keyboard that never goes quiet keeps it held")
-        h.expect(grace.engage() && grace.phase == .live && lives == 1,
-                 "engage: a click past the minimum delay makes it live at once, keyboard busy or not")
+        h.expect(grace.acceptsClicks && grace.engage() && grace.phase == .live && lives == 1,
+                 "engage: a click after the block makes it live at once, keyboard busy or not")
         h.expect(grace.engage() && lives == 1, "engage: engaging a live chooser again changes nothing")
         spinRunLoop(seconds: 0.1)
         h.expect(lives == 1, "engage: the pending re-check never fires once it's live")
+    }
+
+    do {
+        // The click block is measured from when it appeared, not from going live: a chooser live
+        // at the minimum delay still ignores clicks until the block is over.
+        let grace = InteractionGrace(
+            minimumDelay: 0.05, requiredKeyboardIdle: 0.4, clickQuietPeriod: 0.3, clickBlockPeriod: 0.3,
+            keyboardIdle: { 3600 }, onLive: {})
+        grace.begin()
+        spinRunLoop(seconds: 0.15)
+        h.expect(grace.phase == .live && !grace.acceptsClicks, "click block: still blocking clicks after going live early")
+        spinRunLoop(seconds: 0.2)
+        h.expect(grace.acceptsClicks, "click block: clicks count once it's over")
+        grace.cancel()
     }
 
     do {
@@ -169,8 +188,15 @@ func runInteractionGraceTests(_ h: Harness) async {
             && InteractionGrace.keyboardQuietPeriod == 1.0
             && InteractionGrace.keyboardCounterStep == 0.5
             && InteractionGrace.requiredKeyboardIdle == 1.5
-            && InteractionGrace.clickQuietPeriod == 1.0,
-        "production: ≥0.5 s, then 1 s of keyboard quiet plus the counter's 0.5 s step, and 1 s since a click")
+            && InteractionGrace.clickQuietPeriod == 1.0
+            && InteractionGrace.clickBlockPeriod == 1.0,
+        "production: ≥0.5 s, then 1 s of keyboard quiet plus the counter's 0.5 s step, and 1 s since a click; clicks on it blocked for 1 s")
+    h.expect(
+        InteractionGrace.focusLossHoldWindow == 2.0 && InteractionGrace.userActionWindow == 1.0,
+        "production: losing focus within 2 s of going live holds it again; later, only a click or key in the last 1 s cancels")
+    let sinceClick = InteractionGrace.secondsSinceLastClick()
+    h.expect(sinceClick.isFinite && sinceClick >= 0,
+             "production: this process can read how long since the last click (no grant needed)")
     let idle = InteractionGrace.secondsSinceLastKeyPress()
     h.expect(idle.isFinite && idle >= 0,
              "production: this process can read how long the keyboard has been quiet (no Input Monitoring needed)")

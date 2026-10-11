@@ -16,8 +16,8 @@ import Foundation
 /// once (a) the session's keyboard counter reads `requiredKeyboardIdle` and (b) no click in
 /// another app has landed for `clickQuietPeriod`. A human who was waiting for the chooser gets
 /// it at the minimum delay; one who keeps typing or clicking has not seen it, so there is no cap.
-/// A deliberate click on the chooser itself (`engage()`) makes it live at once, past the minimum
-/// delay.
+/// A deliberate click on the chooser itself (`engage()`) makes it live at once, once
+/// `clickBlockPeriod` has passed.
 ///
 /// Ported from convenient-security's `PromptInteractionGrace`, which guards its approval panels
 /// the same way.
@@ -51,11 +51,37 @@ public final class InteractionGrace: NSObject {
     /// appeared count, so the click that opened the link never delays it.
     nonisolated public static let clickQuietPeriod: TimeInterval = 1.0
 
+    /// How long after the chooser appears (or is held again) a click on it does nothing — no row,
+    /// no close button, no engaging it. A click in flight as it appears lands on whatever it
+    /// appeared over; this is longer than `minimumDelay` because a click is aimed at a spot, and
+    /// the chooser may have appeared on that spot.
+    nonisolated public static let clickBlockPeriod: TimeInterval = 1.0
+
+    /// A live chooser that loses focus this soon after going live is held again rather than
+    /// cancelled: the human was busy elsewhere and hadn't seen it.
+    nonisolated public static let focusLossHoldWindow: TimeInterval = 2.0
+
+    /// Later than `focusLossHoldWindow`, losing focus cancels the chooser only if the human did
+    /// it — a click elsewhere or a key (⌘Tab) this recently. Anything else (the browser just
+    /// picked coming forward from a cold launch, an app activating itself) holds it again.
+    /// Generous enough for a counter that dates an event up to a half-second step early.
+    nonisolated public static let userActionWindow: TimeInterval = 1.0
+
     /// Seconds since a key last went down anywhere in the login session, read from the window
     /// server's event state: when, never which key. Event taps and global key monitors need the
     /// Input Monitoring grant; this counter does not.
     nonisolated public static func secondsSinceLastKeyPress() -> TimeInterval {
         CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown)
+    }
+
+    /// Seconds since any mouse button last went down anywhere in the session, from the same
+    /// counter. Read synchronously, so it already knows about the click that is taking the focus
+    /// away when the chooser hears it has lost key — the global monitor's callback may arrive
+    /// after that.
+    nonisolated public static func secondsSinceLastClick() -> TimeInterval {
+        [CGEventType.leftMouseDown, .rightMouseDown, .otherMouseDown]
+            .map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }
+            .min() ?? .infinity
     }
 
     public enum Phase: Equatable {
@@ -78,6 +104,7 @@ public final class InteractionGrace: NSObject {
     private let minimumDelay: TimeInterval
     private let requiredKeyboardIdle: TimeInterval
     private let clickQuietPeriod: TimeInterval
+    private let clickBlockPeriod: TimeInterval
     private let keyboardIdle: () -> TimeInterval
     private let now: () -> TimeInterval
     private let onLive: () -> Void
@@ -89,6 +116,7 @@ public final class InteractionGrace: NSObject {
     ///   - minimumDelay: the shortest hold; `minimumDelay` in production.
     ///   - requiredKeyboardIdle: the `keyboardIdle` reading the grace waits for.
     ///   - clickQuietPeriod: how long after a click elsewhere the grace waits.
+    ///   - clickBlockPeriod: how long after `begin()` a click on the chooser does nothing.
     ///   - keyboardIdle: seconds since a key last went down; `secondsSinceLastKeyPress()` in
     ///     production. Tests inject a clock, so the developer typing while the suite runs
     ///     changes nothing.
@@ -98,6 +126,7 @@ public final class InteractionGrace: NSObject {
         minimumDelay: TimeInterval = InteractionGrace.minimumDelay,
         requiredKeyboardIdle: TimeInterval = InteractionGrace.requiredKeyboardIdle,
         clickQuietPeriod: TimeInterval = InteractionGrace.clickQuietPeriod,
+        clickBlockPeriod: TimeInterval = InteractionGrace.clickBlockPeriod,
         keyboardIdle: @escaping () -> TimeInterval = InteractionGrace.secondsSinceLastKeyPress,
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         onLive: @escaping () -> Void
@@ -105,6 +134,7 @@ public final class InteractionGrace: NSObject {
         self.minimumDelay = minimumDelay
         self.requiredKeyboardIdle = requiredKeyboardIdle
         self.clickQuietPeriod = clickQuietPeriod
+        self.clickBlockPeriod = clickBlockPeriod
         self.keyboardIdle = keyboardIdle
         self.now = now
         self.onLive = onLive
@@ -119,21 +149,29 @@ public final class InteractionGrace: NSObject {
         schedule(after: minimumDelay)
     }
 
-    /// A click landed in another app while the chooser was held: wait out `clickQuietPeriod`
-    /// from now. The pending check picks it up, so nothing is rescheduled here.
-    public func clickedElsewhere() {
-        guard phase == .waiting else { return }
-        lastClickElsewhere = now()
+    /// A click landed in another app `secondsAgo` while the chooser was held: wait out
+    /// `clickQuietPeriod` from it. The pending check picks it up, so nothing is rescheduled here.
+    /// A chooser held again because a click took its focus passes that click in, since it came a
+    /// moment before this hold began.
+    public func clickedElsewhere(secondsAgo: TimeInterval = 0) {
+        guard phase == .waiting, secondsAgo.isFinite, secondsAgo >= 0 else { return }
+        let at = now() - secondsAgo
+        lastClickElsewhere = max(lastClickElsewhere ?? at, at)
     }
 
-    /// The human clicked the chooser itself. Past the minimum delay that is a deliberate act and
-    /// the chooser goes live at once, whatever the keyboard is doing; inside it, the click may
-    /// have been in flight as the chooser appeared, so the hold carries on. Returns whether the
-    /// chooser is now live.
+    /// Whether a click on the chooser counts yet: false for `clickBlockPeriod` after `begin()`,
+    /// live or not, since the click may have been in flight as the chooser appeared.
+    public var acceptsClicks: Bool {
+        phase != .pending && phase != .cancelled && now() - beganAt >= clickBlockPeriod
+    }
+
+    /// The human clicked the chooser itself. Past the click block that is a deliberate act and
+    /// the chooser goes live at once, whatever the keyboard is doing; inside it, the hold carries
+    /// on. Returns whether the chooser is now live.
     @discardableResult
     public func engage() -> Bool {
         guard phase == .waiting else { return phase == .live }
-        guard now() - beganAt >= minimumDelay else { return false }
+        guard acceptsClicks else { return false }
         becomeLive()
         return true
     }
