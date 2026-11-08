@@ -3,3 +3,11 @@ build/
 .DS_Store
 *.xcodeproj
 .swiftpm/
+
+# Coding agents' local state: settings.local.json keeps approved commands verbatim, secrets included
+# (aveiro av-0.1741.2, ops/agent-guard/README.md).
+**/.claude/settings.local.json
+**/.claude/worktrees/
+**/.claude/scheduled_tasks.lock
+**/.specstory/
+/CLAUDE.local.md
