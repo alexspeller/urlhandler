@@ -21,14 +21,26 @@ public final class Router {
     /// Presents the chooser for an ambiguous decision. Injected by the agent (NSPanel chooser).
     public var presentChooser: (_ url: String, _ promptKeys: [String], _ config: Config) -> Void
 
+    /// Opens a URL in a browser. `Launcher.launch` in the agent; tests record instead of opening.
+    public var openBrowser: (_ browser: BrowserConfig, _ url: String) throws -> Void
+
     public init(
         store: ConfigStore,
         logger: @escaping JSEngine.Logger = { _, _ in },
-        presentChooser: @escaping (String, [String], Config) -> Void = { _, _, _ in }
+        presentChooser: @escaping (String, [String], Config) -> Void = { _, _, _ in },
+        openBrowser: @escaping (BrowserConfig, String) throws -> Void = Launcher.launch(browser:url:)
     ) {
         self.store = store
         self.logger = logger
         self.presentChooser = presentChooser
+        self.openBrowser = openBrowser
+    }
+
+    /// Routes a local file macOS asked us to open (as the default browser we're also sent local
+    /// HTML documents). Rules see it as `file://` plus the absolute, percent-encoded path, which
+    /// is what a rule matching a folder's files compares against.
+    public func handle(filePath: String) async {
+        await handle(urlString: URL(fileURLWithPath: filePath).absoluteString, opener: nil)
     }
 
     public func handle(urlString: String, opener: OpenerInfo?) async {
@@ -60,7 +72,7 @@ public final class Router {
 
     public func launch(browser: BrowserConfig, key: String, url: String) {
         do {
-            try Launcher.launch(browser: browser, url: url)
+            try openBrowser(browser, url)
             logger("info", "opened \(url) in \(key)")
         } catch {
             logger("error", "\(error)")

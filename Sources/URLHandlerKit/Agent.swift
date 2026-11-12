@@ -66,9 +66,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         for filename in filenames {
-            let fileURL = URL(fileURLWithPath: filename)
-            log("info", "open file \(fileURL.path)")
-            Task { await router.handle(urlString: fileURL.absoluteString, opener: nil) }
+            log("info", "open file \(filename)")
+            Task { await router.handle(filePath: filename) }
         }
         sender.reply(toOpenOrPrint: .success)
     }

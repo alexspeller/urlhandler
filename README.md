@@ -86,6 +86,11 @@ async function route(url, ctx) {
 **`ctx`** — `{ opener: { bundleId, name } | null, browsers: [keys], default: key }`. `opener` is the
 app that opened the link (e.g. Slack, Mail).
 
+**Local files** — as the default browser, URLHandler is also sent local HTML files. They reach
+`route()` as `file://` plus the absolute, percent-encoded path (`opener` is `null`), so a folder's
+files can be routed by prefix, e.g.
+`if (url.toLowerCase().startsWith("file:///users/me/library/caches/")) return { browser: "personal" };`.
+
 **Return** — `{ browser: "<key>" }` to open in that browser, optionally with `url` to rewrite the
 target; `{ prompt: true }` (or nothing) to show the chooser.
 
